@@ -1,0 +1,372 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Enable Amazon Macie at a specific time, inspect specified S3 bucket, send results, and disable Macie at a specific time.
+
+Parameters:
+  pBucketName:
+    Description: "The name of the S3 bucket to inspect with Amazon Macie."
+    Type: String
+
+  pEnableTime:
+    Description: "The exact time to enable Macie in cron format (UTC). E.G cron(0 9 * * ? *) for 9:00 AM UTC."
+    Type: String
+
+  pDisableTime:
+    Description: "The exact time to disable Macie in cron format (UTC). e.g cron(0 9 * * ? *) for 9:00 AM UTC."
+    Type: String
+
+  pNotificationEmail:
+    Description: "The email address to send the findings to."
+    Type: String
+    Default: "security-team@email.com"
+
+  pEnvironment:
+      Type: String
+      Description: >-
+        Distinguish between development, test, and production resources.
+      AllowedValues:
+        - dev
+        - test
+        - beta
+        - prod
+        - sbx
+      Default: sbx
+
+  pLayer:
+      Type: String
+      Description: >-
+        Identify a specific application layer of resources.
+      AllowedValues:
+        - database
+        - presentation
+        - api
+        - network
+        - cicd
+      Default: presentation
+
+  pProject:
+      Type: String
+      Description: >-
+        Identify projects that the resource supports. This should always be lowercase.
+        Any whitespace in the project name should be removed. Do not use hyphens or underscores
+        to separate words in the project name.
+      Default: wow
+  pMacieResults:
+      Type: String
+      Description: >-
+        A name for the Macie results bucket.
+      Default: macie-results
+
+  pPrefix:
+      Type: String
+      Description: >-
+        A prefix.
+      Default: bty
+
+  pSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      The ID of the first subnet where Lambda should be deployed.
+
+  pSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      The ID of the second subnet where Lambda should be deployed.
+
+  pSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >-
+      The security group ID for Lambda.
+  pKmsMasterKeyId:
+    Type: String
+    Description: >-
+      The KMS key ID to use for encrypting the SNS topic.
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Operations
+        Parameters:
+          - pEnvironment
+          - pProject
+          - pLayer
+    ParameterLabels:
+      pEnvironment:
+        default: Environment
+      pProject:
+        default: Project Name
+      pLayer:
+        default: Layer
+Resources:
+  MacieS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${pMacieResults}-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      Tags:
+        - Key: Name
+          Value: !Sub ${pPrefix}-${pProject}-${pEnvironment}-${pLayer}-MacieResultsBucket
+        - Key: Environment
+          Value: !Ref pEnvironment
+        - Key: Project
+          Value: !Ref pProject
+        - Key: Layer
+          Value: !Ref pLayer
+
+  MacieConfiguration:
+    Type: AWS::Macie::Session
+    Properties:
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+      Status: ENABLED
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "Macie Findings Topic"
+      KmsMasterKeyId: !Ref pKmsMasterKeyId
+      Tags: 
+        - Key: Name
+          Value: !Sub ${pPrefix}-${pProject}-${pEnvironment}-${pLayer}-MacieFindingsTopic
+        - Key: Environment
+          Value: !Ref pEnvironment
+        - Key: Project
+          Value: !Ref pProject
+        - Key: Layer
+          Value: !Ref pLayer
+
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref SNSTopic
+      Endpoint: !Ref pNotificationEmail
+
+  EnableMacieLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: 
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: "EnableMaciePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "macie2:EnableMacie"
+                  - "macie2:CreateClassificationJob"
+                  - "macie2:DescribeClassificationJob"
+                  - "macie2:ListFindings"
+                  - "macie2:GetFindings"
+                  - "sns:Publish"
+                  - "s3:GetBucketLocation"
+                  - "s3:ListBucket"
+                  - "s3:GetObject"
+                Resource:
+                  - !Sub "arn:aws:s3:::${pBucketName}"
+                  - !Sub "arn:aws:s3:::${pMacieResults}-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${pPrefix}-${pProject}-${pEnvironment}-${pLayer}-MacieFindingsTopic"
+
+
+  EnableMacieLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: "index.lambda_handler"
+      Role: !GetAtt EnableMacieLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+
+          def lambda_handler(event, context):
+              macie_client = boto3.client('macie2')
+              
+              # Enable Macie
+              macie_client.enable_macie()
+              
+              # Create and run a classification job
+              response = macie_client.create_classification_job(
+                  jobType='ONE_TIME',
+                  s3JobDefinition={
+                      'bucketDefinitions': [
+                          {
+                              'accountId': context.invoked_function_arn.split(":")[4],
+                              'buckets': [event['BucketName']]
+                          }
+                      ]
+                  },
+                  name='S3ClassificationJob',
+                  samplingPercentage=100
+              )
+              
+              job_id = response['jobId']
+              # Wait for the job to complete
+              while True:
+                  job_status = macie_client.describe_classification_job(jobId=job_id)['jobStatus']
+                  if job_status in ['COMPLETE', 'USER_PAUSED', 'CANCELLED']:
+                      break
+                  time.sleep(600)  # Check every 10 minutes
+              
+              # Process and send findings
+              findings = macie_client.list_findings(classificationJobId=job_id)
+              if findings['findingIds']:
+                  finding_details = macie_client.get_findings(findingIds=findings['findingIds'])
+                  # Send findings via SNS
+                  sns_client = boto3.client('sns')
+                  sns_client.publish(
+                      TopicArn=event['SNSTopicArn'],
+                      Message=str(finding_details),
+                      Subject='Amazon Macie Findings'
+                  )
+      Runtime: "python3.12"
+      Timeout: 900
+      ReservedConcurrentExecutions: 1
+      VpcConfig:
+        SubnetIds:
+          - !Ref pSubnet1
+          - !Ref pSubnet2
+        SecurityGroupIds:
+          - !Ref pSecurityGroup
+      Environment:
+        Variables:
+          BucketName: !Ref pBucketName
+          SNSTopicArn: !Ref SNSTopic
+      Tags:
+        - Key: Name
+          Value: !Sub ${pPrefix}-${pProject}-${pEnvironment}-${pLayer}-EnableMacieLambdaFunction
+        - Key: Environment
+          Value: !Ref pEnvironment
+        - Key: Project
+          Value: !Ref pProject
+        - Key: Layer
+          Value: !Ref pLayer
+
+  DisableMacieLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: 
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: "DisableMaciePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "macie2:DisableMacie"
+                Resource: "*"
+#Set resource to "*" because Macie doesn't support specifying the resource ARN for the DisableMacie action.
+          
+      Tags:
+        - Key: Name
+          Value: !Sub ${pPrefix}-${pProject}-${pEnvironment}-${pLayer}-DisableMacieLambdaRole
+        - Key: Environment
+          Value: !Ref pEnvironment
+        - Key: Project
+          Value: !Ref pProject
+        - Key: Layer
+          Value: !Ref pLayer
+
+  DisableMacieLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: "index.lambda_handler"
+      Role: !GetAtt DisableMacieLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+
+          def lambda_handler(event, context):
+              macie_client = boto3.client('macie2')
+              
+              # Disable Macie
+              macie_client.disable_macie()
+      Runtime: "python3.12"
+      Timeout: 300
+      ReservedConcurrentExecutions: 1
+      VpcConfig:
+        SubnetIds:
+          - !Ref pSubnet1
+          - !Ref pSubnet2
+        SecurityGroupIds:
+          - !Ref pSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${pPrefix}-${pProject}-${pEnvironment}-${pLayer}-DisableMacieLambdaFunction
+        - Key: Environment
+          Value: !Ref pEnvironment
+        - Key: Project
+          Value: !Ref pProject
+        - Key: Layer
+          Value: !Ref pLayer
+
+  EnableMacieTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: "EnableMacieTrigger"
+      ScheduleExpression: !Ref pEnableTime
+      Targets:
+        - Arn: !GetAtt EnableMacieLambdaFunction.Arn
+          Id: "EnableMacieLambdaTarget"
+          InputTransformer:
+            InputPathsMap:
+              BucketName: "$.BucketName"
+              SNSTopicArn: "$.SNSTopicArn"
+            InputTemplate: '{"BucketName": "<BucketName>", "SNSTopicArn": "<SNSTopicArn>"}'
+      State: "ENABLED"
+
+  DisableMacieTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: "DisableMacieTrigger"
+      ScheduleExpression: !Ref pDisableTime
+      Targets:
+        - Arn: !GetAtt DisableMacieLambdaFunction.Arn
+          Id: "DisableMacieLambdaTarget"
+      State: "ENABLED"
+      
+  EnableMacieLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EnableMacieLambdaFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt EnableMacieTrigger.Arn
+
+  DisableMacieLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DisableMacieLambdaFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt DisableMacieTrigger.Arn
+
+
+Outputs:
+  MacieResultsBucket:
+    Description: "The S3 bucket where Macie results are stored."
+    Value: !Ref MacieS3Bucket
