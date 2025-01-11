@@ -9,12 +9,12 @@ This CloudFormation template automates the process of enabling Amazon Macie, per
 - **pBucketName**: The name of the S3 bucket to inspect with Amazon Macie.
 - **pEnableTime**: The exact time to enable Macie in cron format (UTC). Example: `cron(0 9 * * ? *)` for 9:00 AM UTC.
 - **pDisableTime**: The exact time to disable Macie in cron format (UTC). Example: `cron(0 9 * * ? *)` for 9:00 AM UTC.
-- **pNotificationEmail**: The email address to send the findings to. Default: `mxolisi.tshezi@batsamayi.com`.
+- **pNotificationEmail**: The email address to send the findings to. Default: `security-team@email.com`.
 - **pEnvironment**: Distinguish between development, test, and production resources. Allowed values: `dev`, `test`, `beta`, `prod`, `sbx`. Default: `sbx`.
 - **pLayer**: Identify a specific application layer of resources. Allowed values: `database`, `presentation`, `api`, `network`, `cicd`. Default: `presentation`.
-- **pProject**: Identify projects that the resource supports. The name should be lowercase and without hyphens or underscores. Default: `wow`.
+- **pProject**: Identify projects that the resource supports. The name should be lowercase and without hyphens or underscores. Default: `automation`.
 - **pMacieResults**: A name for the Macie results bucket. Default: `macie-results`.
-- **pPrefix**: A prefix for resource naming. Default: `bty`.
+- **pPrefix**: A prefix for resource naming. Default: `Compnay-Prefix`.
 
 ## Resources
 
